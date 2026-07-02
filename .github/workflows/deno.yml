@@ -375,8 +375,9 @@ const DB=(()=>{const mem={};
    ========================================================================= */
 const SNAP_KEY="hsa_state_v4";
 function buildSnapshot(){
-  return {v:4,updatedAt:Date.now(),
+  return {v:5,updatedAt:Date.now(),
     signals:STATE.signals,watchlist:STATE.watchlist,universe:STATE.universe,
+    active:STATE.active,closedSignals:STATE.closedSignals,pending:STATE.pending,
     market_context:STATE.market_context,
     last_scan_at:STATE.last_scan_at?new Date(STATE.last_scan_at).toISOString():null,
     feedback:(DB.get("feedback")||[])};
@@ -387,6 +388,9 @@ function restoreSnapshot(snap){
     if(Array.isArray(snap.signals))STATE.signals=snap.signals;
     if(Array.isArray(snap.watchlist))STATE.watchlist=snap.watchlist;
     if(Array.isArray(snap.universe))STATE.universe=snap.universe;
+    if(Array.isArray(snap.active))STATE.active=snap.active;
+    if(Array.isArray(snap.closedSignals))STATE.closedSignals=snap.closedSignals;
+    if(snap.pending&&typeof snap.pending==="object")STATE.pending=snap.pending;
     if(snap.market_context)STATE.market_context=snap.market_context;
     STATE.last_scan_at=snap.last_scan_at?new Date(snap.last_scan_at):STATE.last_scan_at;
     if(Array.isArray(snap.feedback))DB.set("feedback",snap.feedback);
@@ -1106,7 +1110,68 @@ async function fetchKlines(sym,iv,limit=S.kline_limit){return parseKlines(await 
 async function fetchTickers(){return jget(`/fapi/v1/ticker/24hr`);}
 async function fetchFundingMap(){const a=await jget(`/fapi/v1/premiumIndex`);const m={};a.forEach(x=>m[x.symbol]=+x.lastFundingRate||0);return m;}
 
+/* =========================================================================
+   USDT DOMINANCE (لایو) — از CoinGecko /global (رایگان، بدون کلید، CORS باز).
+   جهت از رگرسیون روی تاریخچهٔ نمونه‌ها ساخته می‌شود (نه مقایسهٔ تک‌نقطه‌ای)،
+   تا با نویزِ یک نمونه جهت عوض نشود. اگر CoinGecko در دسترس نبود، پنل به
+   پروکسی BTC برمی‌گردد و صادقانه «در دسترس نیست» نشان می‌دهد.
+   ========================================================================= */
+const DOM={url:"https://api.coingecko.com/api/v3/global",maxSamples:48,minGapMs:120000,trendMin:0.03,strongMin:0.10};
+function domLoad(){const d=DB.get("usdtDom")||{samples:[]};if(!Array.isArray(d.samples))d.samples=[];return d;}
+function domSave(d){DB.set("usdtDom",d);}
+async function fetchUsdtDominance(){
+  const st=domLoad();const now=Date.now();
+  const last=st.samples[st.samples.length-1];
+  // بیشتر از هر ۲ دقیقه یک‌بار نمونه نگیر (rate-limit رایگان CoinGecko)
+  if(last&&now-last.t<DOM.minGapMs)return domState(st,true);
+  try{
+    const r=await fetch(DOM.url,{cache:"no-store"});
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    const j=await r.json();
+    const pct=j&&j.data&&j.data.market_cap_percentage&&+j.data.market_cap_percentage.usdt;
+    if(!isFinite(pct)||pct<=0)throw new Error("no usdt pct");
+    st.samples.push({t:now,v:pct});
+    if(st.samples.length>DOM.maxSamples)st.samples.splice(0,st.samples.length-DOM.maxSamples);
+    st.lastOkAt=now;domSave(st);
+    return domState(st,true);
+  }catch(e){
+    // خرابی شبکه/فیلتر: با نمونه‌های قدیمی (اگر تازه باشند) ادامه بده، وگرنه unavailable
+    const fresh=last&&(now-last.t)<30*60000;
+    return fresh?domState(st,true):domState(st,false);
+  }
+}
+function domState(st,available){
+  const s=st.samples;
+  if(!available||s.length===0)return{available:false,value:null,dir:"UNKNOWN",slopePerHr:0,samples:s.length};
+  const value=s[s.length-1].v;
+  if(s.length<3)return{available:true,value,dir:"FLAT",slopePerHr:0,samples:s.length};
+  // رگرسیون خطی روی نمونه‌های اخیر → شیب برحسب واحدِ درصد در ساعت
+  const win=s.slice(-12);
+  const t0=win[0].t;const pts=win.map(p=>[(p.t-t0)/3600000,p.v]);
+  const f=lineFit(pts);const slope=f.slope;
+  let dir="FLAT";
+  if(slope>=DOM.trendMin)dir=slope>=DOM.strongMin?"UP_STRONG":"UP";
+  else if(slope<=-DOM.trendMin)dir=slope<=-DOM.strongMin?"DOWN_STRONG":"DOWN";
+  return{available:true,value,dir,slopePerHr:slope,samples:s.length};
+}
+function domConflicts(r,dom){
+  // USDT.D صعودی = پول به تتر = فشار روی آلت‌ها → LONGِ آلت نگه داشته شود
+  // USDT.D نزولی = ریسک‌آن → SHORTِ آلت (در حالت قوی) نگه داشته شود
+  if(!dom||!dom.available)return false;
+  if(r.binance_symbol==="BTCUSDT")return false;
+  if(typeof COMMODITY_KEEP!=="undefined"&&COMMODITY_KEEP.has(r.asset_symbol))return false;
+  if(r.direction==="LONG")return dom.dir==="UP"||dom.dir==="UP_STRONG";
+  if(r.direction==="SHORT")return dom.dir==="DOWN_STRONG";
+  return false;
+}
+function domFa(dom){
+  if(!dom||!dom.available)return"USDT.D: در دسترس نیست";
+  const arrow={UP_STRONG:"▲▲",UP:"▲",FLAT:"◆",DOWN:"▼",DOWN_STRONG:"▼▼"}[dom.dir]||"◆";
+  return`USDT.D ${dom.value.toFixed(2)}% ${arrow}`;
+}
+
 async function fetchMarketContext(){
+  let base;
   try{
     const k1h=await fetchKlines("BTCUSDT","1h",S.kline_limit);
     const m=timeframeMetrics(k1h,"1h");
@@ -1114,8 +1179,11 @@ async function fetchMarketContext(){
     let risk_mode="NEUTRAL";
     if(m.direction==="LONG"&&chg>0)risk_mode="RISK_ON";
     else if(m.direction==="SHORT"&&chg<-1.5)risk_mode="RISK_OFF";
-    return{risk_mode,btc_dir:m.direction,btc_change_24h:chg};
-  }catch(e){return{risk_mode:"UNKNOWN"};}
+    base={risk_mode,btc_dir:m.direction,btc_change_24h:chg};
+  }catch(e){base={risk_mode:"UNKNOWN"};}
+  try{base.usdt_dom=await fetchUsdtDominance();}catch(e){base.usdt_dom={available:false,dir:"UNKNOWN",value:null};}
+  // مهم: risk_mode (ورودی امتیاز موتور) دست نمی‌خورد — دامیننس فقط در لایهٔ پایداری/نمایش اثر دارد.
+  return base;
 }
 const FX_FIAT=new Set(["EUR","GBP","JPY","AUD","NZD","CAD","CHF","CNH","CNY","HKD","SGD","MXN","ZAR","TRY","SEK","NOK","DKK","PLN","HUF","CZK","INR","RUB","BRL","KRW","THB","IDR","PHP","MYR","AED","SAR","QAR","ILS","CLP","COP","RON","ISK","USD","EURO"]);
 const COMMODITY_KEEP=new Set(["XAU","XAUT","PAXG","GOLD","XAG","SILVER","SLV","OIL","USOIL","UKOIL","WTI","WTIUSD","BRENT","CRUDE","NGAS"]);
@@ -1145,9 +1213,97 @@ async function pool(items,worker,limit,onEach){
 /* =========================================================================
    STATE + SCAN
    ========================================================================= */
-const STATE={signals:[],watchlist:[],universe:[],market_context:{},last_scan_at:null,scanning:false};
+const STATE={signals:[],watchlist:[],universe:[],active:[],closedSignals:[],pending:{},market_context:{},last_scan_at:null,scanning:false};
 const LIFE=["NO_SETUP","WATCHING","APPROACHING_ENTRY_ZONE","WAITING_CONFIRMATION","VALID_ENTRY","SIGNAL"];
 const LIFE_SHORT={NO_SETUP:"no setup",WATCHING:"watching",APPROACHING_ENTRY_ZONE:"approach",WAITING_CONFIRMATION:"confirm",VALID_ENTRY:"valid",SIGNAL:"signal"};
+
+/* =========================================================================
+   SIGNAL STABILITY LAYER — «ورود سخت، خروج چسبنده»
+   موتور و آستانه‌های قفل‌شده دست‌نخورده‌اند؛ این لایه فقط تعیین می‌کند یک
+   سیگنالِ صادرشده کِی وارد پنل شود و کِی خارج — مثل یک تریدر، نه یک اندیکاتور.
+   ورود: ۲ اسکن پیاپی SIGNAL + عدم تضاد شدید با BTC + نبود CHoCH مخالف در ۵م.
+   خروج: فقط SL/TP2/فلیپ قوی/انقضا — یا ۳ اسکن پیاپیِ ضعیف (نه یک نوسان).
+   ========================================================================= */
+const STAB={confirmScans:2,weakScansToDrop:3,maxAgeMin:480,flipScore:S.strong_signal_score};
+function fresh5mChochAgainst(r){
+  try{
+    const m5=r.metrics&&r.metrics["5m"];if(!m5)return false;
+    if(r.direction==="LONG")return m5.direction==="SHORT"&&m5.macd_hist<0;
+    if(r.direction==="SHORT")return m5.direction==="LONG"&&m5.macd_hist>0;
+  }catch(e){}
+  return false;
+}
+function btcConflicts(r,btcRow){
+  if(!btcRow||r.binance_symbol==="BTCUSDT")return false;
+  try{
+    const b15=btcRow.metrics["15m"];
+    if(r.direction==="LONG")return b15.direction==="SHORT"&&btcRow.direction==="SHORT"&&btcRow.score>=S.ready_score;
+    if(r.direction==="SHORT")return b15.direction==="LONG"&&btcRow.direction==="LONG"&&btcRow.score>=S.ready_score;
+  }catch(e){}
+  return false;
+}
+function updateActiveSignals(rows){
+  const now=Date.now();
+  const btcRow=rows.find(x=>x.binance_symbol==="BTCUSDT")||null;
+  const bySym={};rows.forEach(x=>bySym[x.binance_symbol]=x);
+  const rawSignals=rows.filter(x=>x.status==="SIGNAL");
+  const pending=STATE.pending||{};
+  const stillActive=[];
+  for(const a of (STATE.active||[])){
+    const cur=bySym[a.binance_symbol];
+    const price=cur?cur.entry:null;
+    let close=null;
+    if(price!=null){
+      if(a.direction==="LONG"){
+        if(price<=a.sl)close="STOPPED";
+        else if(price>=a.tp2)close="TP2_HIT";
+        else if(!a.tp1Hit&&price>=a.tp1){a.tp1Hit=true;a.events.push("TP1 ✓ "+fmtTime(new Date()));}
+      }else{
+        if(price>=a.sl)close="STOPPED";
+        else if(price<=a.tp2)close="TP2_HIT";
+        else if(!a.tp1Hit&&price<=a.tp1){a.tp1Hit=true;a.events.push("TP1 ✓ "+fmtTime(new Date()));}
+      }
+    }
+    if(!close&&cur&&cur.status==="SIGNAL"&&cur.direction!==a.direction&&cur.score>=STAB.flipScore)close="FLIPPED";
+    if(!close&&(now-a.bornAt)/60000>STAB.maxAgeMin)close="EXPIRED";
+    if(close){
+      a.closedAt=now;a.closeReason=close;a.lastPrice=price;
+      STATE.closedSignals.unshift(a);STATE.closedSignals.splice(100);
+      continue;
+    }
+    if(cur&&cur.status==="SIGNAL"&&cur.direction===a.direction){a.weak=0;a.score=cur.score;}
+    else{a.weak=(a.weak||0)+1;}
+    if(a.weak>=STAB.weakScansToDrop){
+      a.closedAt=now;a.closeReason="WEAKENED";a.lastPrice=price;
+      STATE.closedSignals.unshift(a);STATE.closedSignals.splice(100);
+      continue;
+    }
+    a.lastPrice=price!=null?price:a.lastPrice;
+    stillActive.push(a);
+  }
+  STATE.active=stillActive;
+  const activeSyms=new Set(STATE.active.map(x=>x.binance_symbol));
+  const nextPending={};
+  for(const r of rawSignals){
+    if(activeSyms.has(r.binance_symbol))continue;
+    if(btcConflicts(r,btcRow)){nextPending[r.binance_symbol]={n:0,why:"تضاد با BTC — نگه‌داشته شد",r};continue;}
+    if(domConflicts(r,STATE.market_context&&STATE.market_context.usdt_dom)){nextPending[r.binance_symbol]={n:0,why:"دامیننس تتر مخالف — نگه‌داشته شد",r};continue;}
+    if(fresh5mChochAgainst(r)){nextPending[r.binance_symbol]={n:0,why:"ساختار ۵م مخالف — نگه‌داشته شد",r};continue;}
+    const p=pending[r.binance_symbol];
+    const n=(p&&p.n?p.n:0)+1;
+    if(n>=STAB.confirmScans){
+      STATE.active.push({
+        binance_symbol:r.binance_symbol,asset_symbol:r.asset_symbol,direction:r.direction,
+        setup:r.setup,score:r.score,entry:r.entry,sl:r.stop_loss,tp1:r.tp1,tp2:r.tp2,rr:r.rr,
+        bornAt:now,weak:0,tp1Hit:false,lastPrice:r.entry,events:["صدور "+fmtTime(new Date())]
+      });
+    }else{
+      nextPending[r.binance_symbol]={n,why:`تأیید ${n}/${STAB.confirmScans} — منتظر اسکن بعدی`,r};
+    }
+  }
+  STATE.pending=nextPending;
+  STATE.active.sort((a,b)=>b.bornAt-a.bornAt);
+}
 
 async function runScan(){
   if(STATE.scanning)return;STATE.scanning=true;setScanning(true);
@@ -1161,10 +1317,11 @@ async function runScan(){
     rows.sort((a,b)=>(a.rank||999)-(b.rank||999));
     STATE.universe=rows;
     STATE.signals=rows.filter(r=>r.status==="SIGNAL").sort((a,b)=>b.score-a.score||b.quote_volume-a.quote_volume);
+    updateActiveSignals(rows);
     STATE.watchlist=rows.filter(r=>["WATCHING","APPROACHING_ENTRY_ZONE","WAITING_CONFIRMATION","VALID_ENTRY"].includes(r.status)).sort((a,b)=>b.score-a.score);
     STATE.last_scan_at=new Date();
     hideProg();
-    setStatus(`اسکن کامل شد · ${rows.length} نماد · ${STATE.signals.length} سیگنال · ${STATE.watchlist.length} در واچ‌لیست · ${fmtTime(STATE.last_scan_at)}`);
+    setStatus(`اسکن کامل شد · ${rows.length} نماد · ${STATE.active.length} سیگنال فعال · ${Object.keys(STATE.pending).length} در انتظار تأیید · ${STATE.watchlist.length} واچ‌لیست · ${fmtTime(STATE.last_scan_at)}`);
     renderAll();
     saveLocal(); if(SYNC.on())SYNC.push();
   }catch(e){
@@ -1188,7 +1345,10 @@ function renderRegime(){
   const c=STATE.market_context||{},col={RISK_ON:"var(--long)",RISK_OFF:"var(--short)",NEUTRAL:"var(--watch)",UNKNOWN:"var(--gray)"}[c.risk_mode]||"var(--gray)";
   $("#regime").firstElementChild.style.background=col;
   const fa={RISK_ON:"ریسک‌پذیر",RISK_OFF:"ریسک‌گریز",NEUTRAL:"خنثی",UNKNOWN:"نامشخص"}[c.risk_mode]||"نامشخص";
-  $("#regimeTxt").innerHTML=`رژیم بازار: ${fa} `+(c.btc_dir?`· BTC ${c.btc_dir} ${c.btc_change_24h>=0?"+":""}${(c.btc_change_24h||0).toFixed(1)}%`:"");
+  const d=c.usdt_dom;
+  const domCol=!d||!d.available?"var(--dim)":(d.dir==="UP"||d.dir==="UP_STRONG")?"var(--short)":(d.dir==="DOWN"||d.dir==="DOWN_STRONG")?"var(--long)":"var(--mut)";
+  const domHtml=` · <span style="color:${domCol}">${domFa(d)}</span>`;
+  $("#regimeTxt").innerHTML=`رژیم بازار: ${fa} `+(c.btc_dir?`· BTC ${c.btc_dir} ${c.btc_change_24h>=0?"+":""}${(c.btc_change_24h||0).toFixed(1)}%`:"")+domHtml;
 }
 function railHTML(status,direction){
   const idx=LIFE.indexOf(status);const rej=idx<0;
@@ -1218,12 +1378,50 @@ function signalCard(r){
     <div style="padding:0 14px 13px"><button class="btn ghost" style="width:100%" onclick='openDeep("${r.binance_symbol}")'>تحلیل کامل + الگو روی چارت</button></div>
   </div>`;
 }
+function activeCard(a){
+  const ageMin=Math.round((Date.now()-a.bornAt)/60000);
+  const age=ageMin<60?ageMin+" دقیقه":Math.round(ageMin/60*10)/10+" ساعت";
+  const chips=[
+    `<span class="tag">${a.setup}</span>`,
+    `<span class="tag">RR ${fmt(a.rr,2)}</span>`,
+    `<span class="tag">عمر ${age}</span>`,
+    a.tp1Hit?`<span class="tag" style="color:var(--long);border-color:#1c6b53">TP1 زده ✓ (SL→ورود)</span>`:"",
+    (a.weak||0)>0?`<span class="tag warn">در حال تضعیف ${a.weak}/${STAB.weakScansToDrop}</span>`:`<span class="tag" style="color:var(--valid);border-color:#1c6b53">پایدار ✓</span>`,
+  ].filter(Boolean).join("");
+  const pl=a.lastPrice!=null?((a.direction==="LONG"?a.lastPrice/a.entry-1:1-a.lastPrice/a.entry)*100):null;
+  return `<div class="card fade">
+    <div class="top"><span class="sym">${a.asset_symbol}</span>
+      <span class="side ${a.direction}">${a.direction}</span>
+      <span class="statuspill st-SIGNAL" style="margin-inline-start:auto">فعال</span></div>
+    <div class="scorebig">امتیاز صدور <b>${fmt(a.score,1)}</b>${pl!=null?` · حرکت از ورود <b style="color:${pl>=0?"var(--long)":"var(--short)"}">${pl>=0?"+":""}${pl.toFixed(2)}%</b>`:""}</div>
+    <div class="levels">
+      <div><div class="k">entry (قفل)</div><div class="val">${fmt(a.entry)}</div></div>
+      <div><div class="k">stop</div><div class="val sl">${fmt(a.sl)}</div></div>
+      <div><div class="k">tp1</div><div class="val tp">${fmt(a.tp1)}</div></div>
+      <div><div class="k">tp2</div><div class="val tp">${fmt(a.tp2)}</div></div>
+    </div>
+    <div class="tags">${chips}</div>
+    <div style="padding:0 14px 13px"><button class="btn ghost" style="width:100%" onclick='openDeep("${a.binance_symbol}")'>تحلیل کامل + الگو</button></div>
+  </div>`;
+}
+const CLOSE_FA={STOPPED:"استاپ خورد",TP2_HIT:"TP2 کامل ✓",FLIPPED:"فلیپ جهت",EXPIRED:"منقضی (۸س)",WEAKENED:"تضعیف ۳اسکن"};
 function renderSignals(){
-  $("#cSig").textContent=STATE.signals.length;
+  $("#cSig").textContent=STATE.active.length;
   const v=$("#view-signals");
-  v.innerHTML=`<div class="section-title"><span class="eyebrow">tradable</span><h2>سیگنال‌ها</h2></div>`+
-    (STATE.signals.length?`<div class="grid">${STATE.signals.map(signalCard).join("")}</div>`:
-    `<div class="empty">هنوز سیگنالی نیست. سیگنال فقط وقتی صادر می‌شود که همهٔ فیلترهای سخت پاس شوند — بقیه در واچ‌لیست می‌مانند. یک اسکن بزن.</div>`);
+  const pend=Object.entries(STATE.pending||{});
+  const pendHtml=pend.length?`<div class="box" style="margin-bottom:12px"><h3>در انتظار تأیید (فیلتر پایداری)</h3><div class="candsig">`+
+    pend.map(([s,p])=>`<span class="c ${p.r&&p.r.direction==="LONG"?"L":"S"}">${s.replace("USDT","")} · ${p.why}</span>`).join("")+
+    `</div><p class="dim" style="font-size:11.5px;margin-top:8px">سیگنال فقط بعد از ${STAB.confirmScans} اسکن پیاپی + نبود تضاد BTC/ساختار ۵م وارد پنل می‌شود؛ بعد از ورود، با نوسان حذف نمی‌شود.</p></div>`:"";
+  const closed=STATE.closedSignals.slice(0,8);
+  const closedHtml=closed.length?`<div class="box" style="margin-top:12px"><h3>سیگنال‌های بسته‌شده (آخرین‌ها)</h3>`+
+    closed.map(c=>`<div class="fbitem"><div class="t">${fmtTime(c.closedAt)}</div>
+      <div><span class="s">${c.asset_symbol}</span> <span class="dim mono" style="font-size:11px">${c.direction} · ورود ${fmt(c.entry)}${c.tp1Hit?" · TP1✓":""}</span></div>
+      <div class="fbverdict ${c.closeReason==="TP2_HIT"?"v-win":c.closeReason==="STOPPED"?"v-loss":"v-reject"}">${CLOSE_FA[c.closeReason]||c.closeReason}</div></div>`).join("")+`</div>`:"";
+  v.innerHTML=`<div class="section-title"><span class="eyebrow">active · sticky</span><h2>سیگنال‌های فعال</h2></div>`+
+    pendHtml+
+    (STATE.active.length?`<div class="grid">${STATE.active.map(activeCard).join("")}</div>`:
+    `<div class="empty">سیگنال فعالی نیست. سیگنال بعد از ${STAB.confirmScans} اسکن پیاپیِ تأییدشده وارد می‌شود و فقط با SL/TP2/فلیپ قوی/انقضا یا ${STAB.weakScansToDrop} اسکن ضعیف خارج می‌شود — نه با یک نوسان.</div>`)+
+    closedHtml;
 }
 function watchRow(r){
   return `<div class="card fade">
